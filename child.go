@@ -11,6 +11,8 @@ type child struct {
 	proc           process
 	readyR, namesW *os.File
 	ready          <-chan *os.File
+	prepared       <-chan struct{}
+	aborted        <-chan struct{}
 	result         <-chan error
 	exited         <-chan struct{}
 }
@@ -59,9 +61,18 @@ func startChild(env *env, passedFiles map[fileName]*file) (*child, error) {
 		return nil, fmt.Errorf("can't start process %s: %s", os.Args[0], err)
 	}
 
+	// The child now owns its copies of readyW and namesR. Close the
+	// parent's copies, so that the parent observes EOF on readyR once
+	// the child closes readyW (or dies) without committing, and so
+	// that the descriptors don't leak.
+	readyW.Close()
+	namesR.Close()
+
 	exited := make(chan struct{})
 	result := make(chan error, 1)
 	ready := make(chan *os.File, 1)
+	prepared := make(chan struct{}, 1)
+	aborted := make(chan struct{})
 
 	c := &child{
 		env,
@@ -69,12 +80,14 @@ func startChild(env *env, passedFiles map[fileName]*file) (*child, error) {
 		readyR,
 		namesW,
 		ready,
+		prepared,
+		aborted,
 		result,
 		exited,
 	}
 	go c.writeNames(fdNames)
 	go c.waitExit(result, exited)
-	go c.waitReady(ready)
+	go c.waitReady(ready, prepared, aborted)
 	return c, nil
 }
 
@@ -94,15 +107,37 @@ func (c *child) waitExit(result chan<- error, exited chan<- struct{}) {
 	c.namesW.Close()
 }
 
-func (c *child) waitReady(ready chan<- *os.File) {
+func (c *child) waitReady(ready chan<- *os.File, prepared chan<- struct{}, aborted chan<- struct{}) {
+	defer c.readyR.Close()
+
 	var b [1]byte
-	if n, _ := c.readyR.Read(b[:]); n > 0 && b[0] == notifyReady {
-		// We know that writeNames has exited by this point.
-		// Closing the FD now signals to the child that the parent
-		// has exited.
-		ready <- c.namesW
+	for {
+		n, _ := c.readyR.Read(b[:])
+		if n == 0 {
+			// The child closed the pipe (or died) without
+			// committing: the upgrade is rolled back.
+			close(aborted)
+			return
+		}
+
+		switch b[0] {
+		case notifyPrepared:
+			// The child took over its listeners, but isn't
+			// ready to commit yet. Don't block if the parent
+			// hasn't consumed a previous notification.
+			select {
+			case prepared <- struct{}{}:
+			default:
+			}
+
+		case notifyReady:
+			// We know that writeNames has exited by this point.
+			// Closing the FD now signals to the child that the parent
+			// has exited.
+			ready <- c.namesW
+			return
+		}
 	}
-	c.readyR.Close()
 }
 
 func (c *child) writeNames(names [][]string) {

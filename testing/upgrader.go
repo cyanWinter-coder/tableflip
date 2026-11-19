@@ -39,6 +39,18 @@ func (u *Upgrader) Ready() error {
 	return nil
 }
 
+// Prepare does nothing, since it is impossible to inherit with
+// the stub implementation.
+func (u *Upgrader) Prepare() error {
+	return nil
+}
+
+// Rollback does nothing, since there is never a pending upgrade
+// in the stub implementation.
+func (u *Upgrader) Rollback() error {
+	return nil
+}
+
 // Exit returns a channel which is closed when the process should
 // exit.
 // We can return nil here because reading from a nil channel blocks

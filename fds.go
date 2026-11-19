@@ -116,6 +116,77 @@ func (f *Fds) Listen(network, addr string) (net.Listener, error) {
 	return f.ListenWithCallback(network, addr, f.newListener)
 }
 
+// ListenSpec describes a listener to activate, see ListenAll.
+type ListenSpec struct {
+	Network string
+	Addr    string
+}
+
+// ListenAll takes over or creates multiple listeners atomically.
+//
+// If activating any of the listeners fails, all listeners activated
+// so far are closed again: inherited listeners are returned to the
+// pool of inherited fds, and newly created listeners are removed.
+// The old process therefore keeps serving and the call can be
+// retried, e.g. after rolling back a failed upgrade.
+func (f *Fds) ListenAll(specs ...ListenSpec) ([]net.Listener, error) {
+	f.mu.Lock()
+	prevInherited := make(map[fileName]struct{}, len(f.inherited))
+	for key := range f.inherited {
+		prevInherited[key] = struct{}{}
+	}
+	prevUsed := make(map[fileName]struct{}, len(f.used))
+	for key := range f.used {
+		prevUsed[key] = struct{}{}
+	}
+	f.mu.Unlock()
+
+	listeners := make([]net.Listener, 0, len(specs))
+	for _, spec := range specs {
+		ln, err := f.Listen(spec.Network, spec.Addr)
+		if err != nil {
+			for _, ln := range listeners {
+				ln.Close()
+			}
+			f.rollbackActivation(prevInherited, prevUsed)
+			return nil, err
+		}
+		listeners = append(listeners, ln)
+	}
+	return listeners, nil
+}
+
+// rollbackActivation undoes a partially completed ListenAll: files
+// which were moved to the used set since the snapshots were taken are
+// returned to the inherited set (if they were inherited) or closed
+// (if they were newly created).
+func (f *Fds) rollbackActivation(prevInherited, prevUsed map[fileName]struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for key, file := range f.used {
+		if _, ok := prevUsed[key]; ok {
+			continue
+		}
+		delete(f.used, key)
+
+		if _, ok := prevInherited[key]; ok {
+			// Return the file, so that the listener can be
+			// inherited again.
+			f.inherited[key] = file
+			continue
+		}
+
+		if key.isUnix() {
+			// Remove newly created Unix sockets from the file
+			// system. This undoes the effect of
+			// SetUnlinkOnClose(false).
+			_ = unlinkUnixSocket(key[2])
+		}
+		_ = file.Close()
+	}
+}
+
 // ListenWithCallback returns a listener inherited from the parent process,
 // or calls the supplied callback to create a new one.
 //

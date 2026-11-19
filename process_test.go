@@ -109,11 +109,30 @@ func newTestProcess(fds []*os.File, envstr []string) (*testProcess, error) {
 		environ[parts[0]] = parts[1]
 	}
 
+	// Simulate exec: the child receives its own copies of the
+	// passed files, like a real process would.
+	dups := make([]*os.File, len(fds))
+	for i, f := range fds {
+		if f == nil {
+			continue
+		}
+		dup, err := dupFd(f.Fd(), fileName{})
+		if err != nil {
+			for _, dup := range dups {
+				if dup != nil {
+					dup.Close()
+				}
+			}
+			return nil, fmt.Errorf("can't dup fd %d: %s", i, err)
+		}
+		dups[i] = dup.File
+	}
+
 	return &testProcess{
-		fds,
+		dups,
 		env{
 			newFile: func(fd uintptr, name string) *os.File {
-				return fds[fd]
+				return dups[fd]
 			},
 			getenv: func(key string) string {
 				return environ[key]

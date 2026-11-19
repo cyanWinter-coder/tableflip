@@ -44,7 +44,35 @@ type Upgrader struct {
 	upgradeC  chan chan<- error
 	exitC     chan struct{}
 	exitFd    chan neverCloseThisFile
+
+	commitMu sync.Mutex
+	commit   commitState
 }
+
+// commitState tracks the outcome of the upgrade commit phase. An
+// upgrade is committed exactly once: either it is committed via
+// Ready, or it is rolled back via Rollback, never both.
+type commitState int
+
+const (
+	// commitPending: no commit decision has been made yet.
+	commitPending commitState = iota
+	// commitPrepared: listeners are taken over, business not ready.
+	commitPrepared
+	// commitDone: Ready was called, the upgrade is committed.
+	commitDone
+	// commitRolledBack: Rollback was called, the upgrade is aborted.
+	commitRolledBack
+)
+
+var (
+	// ErrCommitted is returned when trying to roll back an upgrade
+	// that has already been committed via Ready.
+	ErrCommitted = errors.New("tableflip: upgrade already committed")
+	// ErrRolledBack is returned when trying to prepare or commit an
+	// upgrade that has already been rolled back.
+	ErrRolledBack = errors.New("tableflip: upgrade already rolled back")
+)
 
 var (
 	stdEnvMu       sync.Mutex
@@ -111,7 +139,18 @@ func newUpgrader(env *env, opts Options) (*Upgrader, error) {
 // It must be called to finish the upgrade.
 //
 // All fds which were inherited but not used are closed after the call to Ready.
+//
+// Ready commits the upgrade: once it has been called, the upgrade can
+// no longer be rolled back via Rollback.
 func (u *Upgrader) Ready() error {
+	u.commitMu.Lock()
+	if u.commit == commitRolledBack {
+		u.commitMu.Unlock()
+		return ErrRolledBack
+	}
+	u.commit = commitDone
+	u.commitMu.Unlock()
+
 	u.readyOnce.Do(func() {
 		u.Fds.closeInherited()
 		close(u.readyC)
@@ -127,6 +166,69 @@ func (u *Upgrader) Ready() error {
 		return nil
 	}
 	return u.parent.sendReady()
+}
+
+// Prepare signals to the parent process that this process has taken
+// over its listeners, but that it is not yet ready to serve traffic.
+//
+// The parent process keeps running and the upgrade can still be
+// aborted via Rollback. Call Ready once the process is fully
+// initialised to commit the upgrade. Prepare is idempotent, and each
+// call resets the parent's upgrade timeout, so it may be used as a
+// heartbeat during a lengthy initialisation.
+//
+// Note: the parent process must run a version of this library which
+// understands the preparation notification, otherwise the upgrade
+// times out.
+func (u *Upgrader) Prepare() error {
+	u.commitMu.Lock()
+	defer u.commitMu.Unlock()
+
+	switch u.commit {
+	case commitDone:
+		return ErrCommitted
+	case commitRolledBack:
+		return ErrRolledBack
+	case commitPending:
+		u.commit = commitPrepared
+	}
+
+	if u.parent == nil {
+		return nil
+	}
+	return u.parent.sendPrepared()
+}
+
+// Rollback aborts a pending upgrade which has not been committed via
+// Ready yet.
+//
+// All inherited file descriptors are closed, including listeners which
+// were already taken over, and the parent process is notified so that
+// it keeps serving with its own listeners intact. An upgrade can only
+// be committed or rolled back once: calling Ready after Rollback (or
+// vice versa) returns an error.
+func (u *Upgrader) Rollback() error {
+	u.commitMu.Lock()
+	switch u.commit {
+	case commitDone:
+		u.commitMu.Unlock()
+		return ErrCommitted
+	case commitRolledBack:
+		u.commitMu.Unlock()
+		return ErrRolledBack
+	}
+	u.commit = commitRolledBack
+	u.commitMu.Unlock()
+
+	// Close inherited descriptors and any listeners which were
+	// already taken over, so that nothing is leaked on the
+	// failure path.
+	u.Fds.closeInherited()
+	if u.parent != nil {
+		u.Fds.closeUsed()
+		u.parent.abort()
+	}
+	return nil
 }
 
 // Exit returns a channel which is closed when the process should
@@ -250,7 +352,13 @@ func (u *Upgrader) doUpgrade() (*os.File, error) {
 		return nil, fmt.Errorf("can't start child: %s", err)
 	}
 
-	readyTimeout := time.After(u.opts.UpgradeTimeout)
+	// The old process keeps serving until the child commits the
+	// upgrade by signalling readiness. Any failure before that
+	// point aborts the upgrade and leaves the old process and
+	// its listeners untouched.
+	timeout := time.NewTimer(u.opts.UpgradeTimeout)
+	defer timeout.Stop()
+
 	for {
 		select {
 		case request := <-u.upgradeC:
@@ -262,13 +370,30 @@ func (u *Upgrader) doUpgrade() (*os.File, error) {
 			}
 			return nil, fmt.Errorf("child %s exited: %s", child, err)
 
+		case <-child.aborted:
+			// The child rolled the upgrade back, e.g. because
+			// its initialisation failed. Keep running.
+			return nil, fmt.Errorf("child %s aborted the upgrade", child)
+
 		case <-u.stopC:
 			child.Kill()
 			return nil, errors.New("terminating")
 
-		case <-readyTimeout:
+		case <-timeout.C:
 			child.Kill()
 			return nil, fmt.Errorf("new child %s timed out", child)
+
+		case <-child.prepared:
+			// The child took over its listeners, but its
+			// business logic isn't ready yet. Don't exit;
+			// give the child more time to commit instead.
+			if !timeout.Stop() {
+				select {
+				case <-timeout.C:
+				default:
+				}
+			}
+			timeout.Reset(u.opts.UpgradeTimeout)
 
 		case file := <-child.ready:
 			return file, nil

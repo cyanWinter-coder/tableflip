@@ -418,6 +418,283 @@ func TestUpgraderReady(t *testing.T) {
 	}
 }
 
+// newChildUpgrader creates an Upgrader which has a parent process,
+// along with the parent-side handle of the child.
+func newChildUpgrader(t *testing.T, opts Options, passedFiles map[fileName]*file) (*Upgrader, *child) {
+	t.Helper()
+
+	env, procs := testEnv()
+	child, err := startChild(env, passedFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proc := <-procs
+	u, err := newUpgrader(&proc.env, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return u, child
+}
+
+func TestUpgraderPrepareDoesntCommit(t *testing.T) {
+	t.Parallel()
+
+	u := newTestUpgrader(Options{})
+	defer u.Stop()
+
+	proc, errs := u.upgradeProc(t)
+
+	parent, _, err := newParent(&proc.env)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The child took over its listeners, but isn't ready yet.
+	if err := parent.sendPrepared(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old process must not exit before the child commits.
+	select {
+	case err := <-errs:
+		t.Fatal("Upgrade returned after prepare:", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	select {
+	case <-u.Exit():
+		t.Error("Exit() closed before child committed")
+	default:
+	}
+
+	// Commit the upgrade.
+	if err := parent.sendReady(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-errs; err != nil {
+		t.Fatal("Expected Upgrade to return nil when child is ready")
+	}
+}
+
+func TestUpgraderPrepareResetsTimeout(t *testing.T) {
+	t.Parallel()
+
+	u := newTestUpgrader(Options{
+		UpgradeTimeout: 500 * time.Millisecond,
+	})
+	defer u.Stop()
+
+	proc, errs := u.upgradeProc(t)
+
+	parent, _, err := newParent(&proc.env)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Prepare halfway through the timeout.
+	time.Sleep(250 * time.Millisecond)
+	if err := parent.sendPrepared(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without the reset the child would be killed ~250ms from now.
+	start := time.Now()
+	if sig := proc.recvSignal(nil); sig != os.Kill {
+		t.Error("Expected os.Kill, got", sig)
+	}
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Error("Timeout was not reset by prepare, killed after", elapsed)
+	}
+
+	if err := <-errs; err == nil {
+		t.Error("Expected Upgrade to return error when child times out")
+	}
+}
+
+func TestUpgraderAbortKeepsOldProcess(t *testing.T) {
+	t.Parallel()
+
+	u := newTestUpgrader(Options{
+		UpgradeTimeout: time.Minute,
+	})
+	defer u.Stop()
+
+	proc, errs := u.upgradeProc(t)
+
+	parent, _, err := newParent(&proc.env)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Roll back: close the notification pipe without sending ready.
+	parent.abort()
+
+	select {
+	case err := <-errs:
+		if err == nil {
+			t.Fatal("Expected Upgrade to fail when child aborts")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Upgrade didn't return after child aborted")
+	}
+
+	// The old process must still accept connections and upgrades.
+	if _, err := u.Listen("tcp", "localhost:0"); err != nil {
+		t.Fatal("Old process lost its listeners:", err)
+	}
+
+	proc2, errs2 := u.upgradeProc(t)
+	if _, _, err := proc2.notify(); err != nil {
+		t.Fatal("Can't notify Upgrader:", err)
+	}
+	if err := <-errs2; err != nil {
+		t.Fatal("Second upgrade failed after rollback:", err)
+	}
+}
+
+func TestChildPrepareThenReady(t *testing.T) {
+	t.Parallel()
+
+	u, child := newChildUpgrader(t, Options{}, nil)
+	defer u.Stop()
+
+	if err := u.Prepare(); err != nil {
+		t.Fatal("Prepare:", err)
+	}
+	if err := u.Prepare(); err != nil {
+		t.Fatal("Prepare is not idempotent:", err)
+	}
+
+	select {
+	case <-child.prepared:
+	case <-time.After(time.Second):
+		t.Fatal("Parent not notified of prepare")
+	}
+
+	if err := u.Ready(); err != nil {
+		t.Fatal("Ready after Prepare:", err)
+	}
+
+	select {
+	case <-child.ready:
+	case <-time.After(time.Second):
+		t.Fatal("Parent not notified of ready")
+	}
+}
+
+func TestChildRollbackThenReadyFails(t *testing.T) {
+	t.Parallel()
+
+	u, child := newChildUpgrader(t, Options{}, nil)
+	defer u.Stop()
+
+	if err := u.Rollback(); err != nil {
+		t.Fatal("Rollback:", err)
+	}
+
+	if err := u.Ready(); err != ErrRolledBack {
+		t.Error("Ready after Rollback should return ErrRolledBack, got", err)
+	}
+	if err := u.Prepare(); err != ErrRolledBack {
+		t.Error("Prepare after Rollback should return ErrRolledBack, got", err)
+	}
+	if err := u.Rollback(); err != ErrRolledBack {
+		t.Error("Second Rollback should return ErrRolledBack, got", err)
+	}
+
+	// The parent observes the abort.
+	select {
+	case <-child.aborted:
+	case <-time.After(time.Second):
+		t.Fatal("Parent not notified of abort")
+	}
+}
+
+func TestChildReadyThenRollbackFails(t *testing.T) {
+	t.Parallel()
+
+	u, child := newChildUpgrader(t, Options{}, nil)
+	defer u.Stop()
+
+	if err := u.Ready(); err != nil {
+		t.Fatal("Ready:", err)
+	}
+
+	if err := u.Rollback(); err != ErrCommitted {
+		t.Error("Rollback after Ready should return ErrCommitted, got", err)
+	}
+	if err := u.Prepare(); err != ErrCommitted {
+		t.Error("Prepare after Ready should return ErrCommitted, got", err)
+	}
+
+	select {
+	case <-child.ready:
+	case <-time.After(time.Second):
+		t.Fatal("Parent not notified of ready")
+	}
+}
+
+func TestChildRollbackClosesInheritedFds(t *testing.T) {
+	t.Parallel()
+
+	u, _ := newChildUpgrader(t, Options{}, nil)
+	defer u.Stop()
+
+	r1, w1, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1.Close()
+	defer w1.Close()
+
+	r2, w2, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+	defer w2.Close()
+
+	// Add a file to the used set.
+	if err := u.Fds.AddFile("used", w1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject a file into the inherited set.
+	inheritedKey := fileName{fdKind, "inherited", ""}
+	inheritedDup, err := dupFd(r2.Fd(), inheritedKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Fds.inherited[inheritedKey] = inheritedDup
+
+	usedFile := u.Fds.used[fileName{fdKind, "used", ""}]
+	if usedFile == nil {
+		t.Fatal("Missing file in used set")
+	}
+
+	if err := u.Rollback(); err != nil {
+		t.Fatal("Rollback:", err)
+	}
+
+	if len(u.Fds.inherited) != 0 {
+		t.Error("Rollback didn't close inherited fds")
+	}
+	if len(u.Fds.used) != 0 {
+		t.Error("Rollback didn't close used fds")
+	}
+
+	// The child's own descriptors must be closed.
+	if err := usedFile.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Error("Used fd is still open after Rollback")
+	}
+	if err := inheritedDup.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Error("Inherited fd is still open after Rollback")
+	}
+}
+
 func TestUpgraderShutdownCancelsUpgrade(t *testing.T) {
 	t.Parallel()
 

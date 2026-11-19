@@ -82,9 +82,13 @@ func TestChildPassedFds(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Reuse the *os.File objects instead of wrapping the same
+	// descriptors twice: two *os.File objects for a single fd
+	// race in their finalizers and can close an unrelated,
+	// recycled descriptor.
 	in := map[fileName]*file{
-		{"r"}: newFile(r.Fd(), fileName{"r"}),
-		{"w"}: newFile(w.Fd(), fileName{"w"}),
+		{"r"}: {File: r, fd: r.Fd()},
+		{"w"}: {File: w, fd: w.Fd()},
 	}
 
 	if _, err := startChild(env, in); err != nil {
@@ -101,12 +105,26 @@ func TestChildPassedFds(t *testing.T) {
 		t.Errorf("Expected %d files, got %d", len(in), len(out))
 	}
 
-	for name, inFd := range in {
-		if outFd, ok := out[name]; !ok {
+	for name := range in {
+		if _, ok := out[name]; !ok {
 			t.Error(name, "is missing")
-		} else if outFd.Fd() != inFd.Fd() {
-			t.Error(name, "fd mismatch:", outFd.Fd(), inFd.Fd())
 		}
+	}
+
+	// The child receives its own copies of the files, referring to
+	// the same underlying pipe. Check both directions.
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal("Can't write to w:", err)
+	}
+	if _, err := out[fileName{"r"}].Read(make([]byte, 1)); err != nil {
+		t.Error("Can't read from child's copy of r:", err)
+	}
+
+	if _, err := out[fileName{"w"}].Write([]byte{1}); err != nil {
+		t.Fatal("Can't write to child's copy of w:", err)
+	}
+	if _, err := r.Read(make([]byte, 1)); err != nil {
+		t.Error("Can't read from r:", err)
 	}
 
 	proc.exit(nil)

@@ -12,6 +12,7 @@ import (
 const (
 	sentinelEnvVar = "TABLEFLIP_HAS_PARENT_7DIU3"
 	notifyReady    = 42
+	notifyPrepared = 43
 )
 
 type parent struct {
@@ -77,4 +78,21 @@ func (ps *parent) sendReady() error {
 		return fmt.Errorf("can't notify parent process: %s", err)
 	}
 	return nil
+}
+
+// sendPrepared notifies the parent process that listeners have been
+// taken over, but that this process is not ready to commit the
+// upgrade yet. The parent must keep running.
+func (ps *parent) sendPrepared() error {
+	if _, err := ps.wr.Write([]byte{notifyPrepared}); err != nil {
+		return fmt.Errorf("can't notify parent process: %s", err)
+	}
+	return nil
+}
+
+// abort rolls back a pending upgrade by closing the notification
+// pipe without sending a ready notification. The parent process
+// notices the closed pipe and keeps running.
+func (ps *parent) abort() {
+	ps.wr.Close()
 }

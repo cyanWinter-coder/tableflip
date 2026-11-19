@@ -345,6 +345,110 @@ func TestFdsRemoveUnix(t *testing.T) {
 	})
 }
 
+func TestFdsListenAll(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		fds := newFds(nil, nil)
+
+		listeners, err := fds.ListenAll(
+			ListenSpec{"tcp", "localhost:0"},
+			ListenSpec{"tcp", "localhost:0"},
+		)
+		if err != nil {
+			t.Fatal("ListenAll failed:", err)
+		}
+		if len(listeners) != 2 {
+			t.Fatalf("Expected 2 listeners, got %d", len(listeners))
+		}
+		for _, ln := range listeners {
+			ln.Close()
+		}
+
+		if len(fds.used) != 2 {
+			t.Errorf("Expected 2 used files, got %d", len(fds.used))
+		}
+	})
+
+	t.Run("created listeners are rolled back", func(t *testing.T) {
+		fds := newFds(nil, nil)
+
+		_, err := fds.ListenAll(
+			ListenSpec{"tcp", "localhost:0"},
+			ListenSpec{"tcp", "256.256.256.256:8080"},
+		)
+		if err == nil {
+			t.Fatal("ListenAll should fail")
+		}
+
+		if len(fds.used) != 0 {
+			t.Errorf("Expected no used files after rollback, got %d", len(fds.used))
+		}
+		if len(fds.inherited) != 0 {
+			t.Errorf("Expected no inherited files after rollback, got %d", len(fds.inherited))
+		}
+
+		// The whole batch can be retried after a rollback.
+		listeners, err := fds.ListenAll(ListenSpec{"tcp", "localhost:0"})
+		if err != nil {
+			t.Fatal("ListenAll after rollback failed:", err)
+		}
+		listeners[0].Close()
+	})
+
+	t.Run("inherited listeners are returned", func(t *testing.T) {
+		parent := newFds(nil, nil)
+		ln, err := parent.Listen("tcp", "localhost:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		ln.Close()
+
+		child := newFds(parent.copy(), nil)
+		_, err = child.ListenAll(
+			ListenSpec{"tcp", addr},
+			ListenSpec{"tcp", "256.256.256.256:8080"},
+		)
+		if err == nil {
+			t.Fatal("ListenAll should fail")
+		}
+
+		if len(child.used) != 0 {
+			t.Errorf("Expected no used files after rollback, got %d", len(child.used))
+		}
+		if len(child.inherited) != 1 {
+			t.Fatalf("Expected inherited file to be returned, got %d", len(child.inherited))
+		}
+
+		// The inherited listener can be taken over again.
+		ln, err = child.Listen("tcp", addr)
+		if err != nil {
+			t.Fatal("Can't inherit listener after rollback:", err)
+		}
+		if ln == nil {
+			t.Fatal("Missing inherited listener after rollback")
+		}
+		ln.Close()
+	})
+
+	t.Run("created unix sockets are removed", func(t *testing.T) {
+		socketPath, cleanup := tempSocket(t)
+		defer cleanup()
+
+		fds := newFds(nil, nil)
+		_, err := fds.ListenAll(
+			ListenSpec{"unix", socketPath},
+			ListenSpec{"tcp", "256.256.256.256:8080"},
+		)
+		if err == nil {
+			t.Fatal("ListenAll should fail")
+		}
+
+		if _, err := os.Stat(socketPath); err == nil {
+			t.Error("Rolled back unix socket was not removed")
+		}
+	})
+}
+
 func TestFdsConn(t *testing.T) {
 	socketPath, cleanup := tempSocket(t)
 	defer cleanup()
