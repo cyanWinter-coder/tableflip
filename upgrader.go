@@ -179,7 +179,17 @@ func (u *Upgrader) HasParent() bool {
 }
 
 // Upgrade triggers an upgrade.
+//
+// At most one upgrade is ever in progress at a given time. Calls made while
+// an upgrade is being prepared are coalesced into a single pending request:
+// they do not spawn another child and do not get an early reply. When the
+// running upgrade fails, one coalesced request drives exactly one retry and
+// every caller observes the result of the attempt it was attached to. A
+// successful upgrade moves the process into the exit phase, after which all
+// calls return an error.
 func (u *Upgrader) Upgrade() error {
+	// The response channel is buffered so that the coordinating goroutine
+	// never blocks on a reply, even if the caller stops waiting for it.
 	response := make(chan error, 1)
 	select {
 	case <-u.stopC:
@@ -189,10 +199,36 @@ func (u *Upgrader) Upgrade() error {
 	case u.upgradeC <- response:
 	}
 
-	return <-response
+	select {
+	case err := <-response:
+		return err
+	case <-u.stopC:
+		// The caller gave up waiting. Abandoning the response does not
+		// cancel anything: the coordinating goroutine keeps owning the
+		// transaction and will never kill a child that took over.
+		return errors.New("terminating")
+	case <-u.exitC:
+		// A concurrent upgrade committed while we were waiting: the
+		// upgrade the caller asked for has effectively happened.
+		return nil
+	}
 }
 
 var errNotReady = errors.New("process is not ready yet")
+
+// upgradeOutcome reports how a single upgrade transaction ended.
+type upgradeOutcome int
+
+const (
+	// upgradeCommitted means the child signalled readiness and the old
+	// process has moved into the exit phase.
+	upgradeCommitted upgradeOutcome = iota
+	// upgradeFailed means the child could not take over, leaving the
+	// current process in charge and able to accept new requests.
+	upgradeFailed
+	// upgradeStopping means Stop was invoked before the child took over.
+	upgradeStopping
+)
 
 func (u *Upgrader) run() {
 	defer close(u.exitC)
@@ -219,60 +255,141 @@ func (u *Upgrader) run() {
 			return
 
 		case request := <-u.upgradeC:
-			if processReady != nil {
-				request <- errNotReady
-				continue
-			}
-
-			if parentExited != nil {
-				request <- errors.New("parent hasn't exited")
-				continue
-			}
-
-			file, err := u.doUpgrade()
-			request <- err
-
-			if err == nil {
-				// Save file in exitFd, so that it's only closed when the process
-				// exits. This signals to the new process that the old process
-				// has exited.
-				u.exitFd <- neverCloseThisFile{file}
-				u.Fds.closeUsed()
+			outcome := u.runUpgradeTransaction(request, processReady != nil, parentExited != nil)
+			switch outcome {
+			case upgradeCommitted:
+				// The process is exiting and must never start another
+				// child. Drain any request that raced the commit and
+				// report success: the upgraded generation the caller
+				// asked for is now running. This matches the exitC
+				// branch of Upgrade so the result is deterministic no
+				// matter which select case the caller wakes up on.
+				u.drainAndReplyUpgradeRequests(nil)
 				return
+			case upgradeStopping:
+				u.Fds.closeAndRemoveUsed()
+				return
+			case upgradeFailed:
+				// The failed transaction is cleaned up and the loop
+				// accepts a fresh, explicit upgrade request.
 			}
 		}
 	}
 }
 
-func (u *Upgrader) doUpgrade() (*os.File, error) {
+// runUpgradeTransaction runs a single upgrade and the at-most-one retry
+// coalesced from requests arriving while a child is being prepared.
+//
+// The initial request is the first caller; every further request received
+// while an attempt is running is queued. A failed attempt consumes at most
+// one queued request to drive a retry, a successful attempt ends the
+// transaction for every queued caller.
+func (u *Upgrader) runUpgradeTransaction(initial chan<- error, notReady, parentAlive bool) upgradeOutcome {
+	waiters := []chan<- error{initial}
+
+	for {
+		if notReady {
+			replyAll(waiters, errNotReady)
+			return upgradeFailed
+		}
+		if parentAlive {
+			replyAll(waiters, errors.New("parent hasn't exited"))
+			return upgradeFailed
+		}
+
+		file, err, outcome := u.attemptUpgrade()
+		switch outcome {
+		case upgradeCommitted:
+			// Save file in exitFd, so that it's only closed when the
+			// process exits. This signals to the new process that the
+			// old process has exited.
+			u.exitFd <- neverCloseThisFile{file}
+			u.Fds.closeUsed()
+			replyAll(waiters, nil)
+			return upgradeCommitted
+		case upgradeStopping:
+			replyAll(waiters, err)
+			return upgradeStopping
+		case upgradeFailed:
+			// The attempt failed. Coalesce every request that arrived
+			// while the child was preparing into one intentional retry,
+			// and clear the failed transaction so a new attempt can
+			// start cleanly.
+			replyAll(waiters, err)
+			waiters = u.drainUpgradeRequests()
+			if len(waiters) == 0 {
+				return upgradeFailed
+			}
+		}
+	}
+}
+
+// attemptUpgrade starts a child and waits for it to take over.
+//
+// Upgrade requests arriving while the child is preparing are left queued on
+// upgradeC for the transaction loop: this function never starts a second
+// child and never answers upgrade requests itself. A child that has
+// signalled readiness is never killed, even if Stop fires concurrently.
+func (u *Upgrader) attemptUpgrade() (*os.File, error, upgradeOutcome) {
 	child, err := startChild(u.env, u.Fds.copy())
 	if err != nil {
-		return nil, fmt.Errorf("can't start child: %s", err)
+		return nil, fmt.Errorf("can't start child: %s", err), upgradeFailed
 	}
 
 	readyTimeout := time.After(u.opts.UpgradeTimeout)
 	for {
 		select {
-		case request := <-u.upgradeC:
-			request <- errors.New("upgrade in progress")
-
 		case err := <-child.result:
 			if err == nil {
-				return nil, fmt.Errorf("child %s exited", child)
+				return nil, fmt.Errorf("child %s exited", child), upgradeFailed
 			}
-			return nil, fmt.Errorf("child %s exited: %s", child, err)
+			return nil, fmt.Errorf("child %s exited: %s", child, err), upgradeFailed
 
 		case <-u.stopC:
 			child.Kill()
-			return nil, errors.New("terminating")
+			return nil, errors.New("terminating"), upgradeStopping
 
 		case <-readyTimeout:
 			child.Kill()
-			return nil, fmt.Errorf("new child %s timed out", child)
+			return nil, fmt.Errorf("new child %s timed out", child), upgradeFailed
 
 		case file := <-child.ready:
-			return file, nil
+			// The child owns the inherited resources now. Do not
+			// select on stopC anymore: a shutdown must not kill a
+			// process that has successfully taken over.
+			return file, nil, upgradeCommitted
 		}
+	}
+}
+
+// drainUpgradeRequests collects every upgrade request currently waiting.
+// The coordinating goroutine is the only receiver of upgradeC, so no
+// requests can be missed.
+func (u *Upgrader) drainUpgradeRequests() []chan<- error {
+	var requests []chan<- error
+	for {
+		select {
+		case request := <-u.upgradeC:
+			requests = append(requests, request)
+		default:
+			return requests
+		}
+	}
+}
+
+// drainAndReplyUpgradeRequests answers any request that raced the end of the
+// coordinating loop. Channels are buffered, so a caller that abandoned its
+// wait never blocks the coordinating goroutine and no goroutine is leaked.
+func (u *Upgrader) drainAndReplyUpgradeRequests(err error) {
+	for _, request := range u.drainUpgradeRequests() {
+		request <- err
+	}
+}
+
+// replyAll delivers err to every waiting caller.
+func replyAll(requests []chan<- error, err error) {
+	for _, request := range requests {
+		request <- err
 	}
 }
 
