@@ -260,6 +260,8 @@ func TestUpgraderUncleanExit(t *testing.T) {
 	proc.exit(errors.New("some error"))
 	if err := <-errs; err == nil {
 		t.Error("Expected Upgrade to return error when new child exits unclean")
+	} else if !errors.Is(err, ErrChildExited) {
+		t.Error("Expected ErrChildExited, got:", err)
 	}
 }
 
@@ -279,6 +281,8 @@ func TestUpgraderTimeout(t *testing.T) {
 
 	if err := <-errs; err == nil {
 		t.Error("Expected Upgrade to return error when new child times out")
+	} else if !errors.Is(err, ErrUpgradeTimeout) {
+		t.Error("Expected ErrUpgradeTimeout, got:", err)
 	}
 }
 

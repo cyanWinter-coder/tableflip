@@ -2,7 +2,6 @@ package tableflip
 
 import (
 	"encoding/gob"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -31,7 +30,7 @@ func newParent(env *env) (*parent, map[fileName]*file, error) {
 	var names [][]string
 	dec := gob.NewDecoder(rd)
 	if err := dec.Decode(&names); err != nil {
-		return nil, nil, fmt.Errorf("can't decode names from parent process: %s", err)
+		return nil, nil, fmt.Errorf("can't decode names from parent process: %w: %s", ErrProtocol, err)
 	}
 
 	files := make(map[fileName]*file)
@@ -56,7 +55,7 @@ func newParent(env *env) (*parent, map[fileName]*file, error) {
 
 		n, err := io.Copy(ioutil.Discard, rd)
 		if n != 0 {
-			err = errors.New("unexpected data from parent process")
+			err = fmt.Errorf("%w: unexpected data from parent process", ErrProtocol)
 		} else if err != nil {
 			err = fmt.Errorf("unexpected error while waiting for parent to exit: %s", err)
 		}

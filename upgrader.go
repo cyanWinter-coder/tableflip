@@ -244,6 +244,13 @@ func (u *Upgrader) run() {
 	}
 }
 
+// drainTimeout bounds how long doUpgrade waits for the child's
+// readiness notification and stderr output to settle after the
+// child has exited. The child's ends of the pipes are at EOF once
+// it is dead, unless a grandchild inherited the fds, so these are
+// only backstops.
+const drainTimeout = time.Second
+
 func (u *Upgrader) doUpgrade() (*os.File, error) {
 	child, err := startChild(u.env, u.Fds.copy())
 	if err != nil {
@@ -256,19 +263,40 @@ func (u *Upgrader) doUpgrade() (*os.File, error) {
 		case request := <-u.upgradeC:
 			request <- errors.New("upgrade in progress")
 
-		case err := <-child.result:
-			if err == nil {
-				return nil, fmt.Errorf("child %s exited", child)
+		case waitErr := <-child.result:
+			// The child exited. It may have signalled readiness
+			// concurrently with exiting: waitExit closed the
+			// ready pipe's write end, so waitReady drains any
+			// buffered notification and then finishes. A
+			// committed readiness wins over the exit, the
+			// upgrade is not rolled back.
+			select {
+			case <-child.readyDone:
+			case <-time.After(drainTimeout):
 			}
-			return nil, fmt.Errorf("child %s exited: %s", child, err)
+			select {
+			case file := <-child.ready:
+				return file, nil
+			default:
+			}
+
+			// Give the stderr drainer a chance to flush the
+			// child's final output into the diagnostic buffer.
+			select {
+			case <-child.stderrDone:
+			case <-time.After(drainTimeout):
+			}
+			err := child.exitError(waitErr)
+			child.cleanup()
+			return nil, err
 
 		case <-u.stopC:
-			child.Kill()
+			child.cleanup()
 			return nil, errors.New("terminating")
 
 		case <-readyTimeout:
-			child.Kill()
-			return nil, fmt.Errorf("new child %s timed out", child)
+			child.cleanup()
+			return nil, fmt.Errorf("new child %s: %w", child, ErrUpgradeTimeout)
 
 		case file := <-child.ready:
 			return file, nil
